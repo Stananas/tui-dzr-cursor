@@ -1,91 +1,51 @@
 ![Deezer TUI Preview](images/preview.png)
-> [!IMPORTANT]  
-> This project was heavily "vibecoded" with AI. I put it together quickly because I just wanted a simple deezer TUI for my own personal use.
+
+# Deezer TUI
+
+A lightweight Deezer client that lives in your terminal. Browse your playlists
+and favorites, discover new music, search the catalog and stream tracks at up
+to FLAC quality — all from your keyboard **or your mouse**.
+
+## Features
+
+- Browse playlists, favorites, Home feed and Explore
+- Search tracks, albums, artists and playlists
+- Queue with repeat, shuffle and crossfade support
+- Stream at 128kbps, 320kbps or FLAC
+- Album artwork (kitty and ueberzugpp get full quality)
+- Discord Rich Presence and MPRIS integration
+- **Full mouse support**: click to select, scroll to navigate, click the
+  progress bar to seek, click the volume row to adjust it
+- Themes: Deezer (default), Spotify and Ncmpcpp — press `T` to cycle
+- Interface in **English** or **French**, switchable in Settings
 
 ## Controls
 
-    Mouse - Click to select, scroll to navigate, click progress bar to seek
-
-    Arrow Keys - Navigate
-
-    TAB - Switch Focus
-
-    Enter - Select
-
-    P - Play/Pause
-
-    / - Search
-
-    T - Cycle themes (Deezer / Spotify / Ncmpcpp)
-
-    Q - Quit
-
-## Features
-- Browse your Playlists, Favorites
-- Explore, Home feed
-- Search for tracks, albums, artists, and playlists
-- Queue
-- Album Artwork support (kitty and ueberzugpp has full quality)
-- Multiple quality options for streaming (128kbps, 320kbps, and FLAC)
-- Discord Rich Presence support
-- Cross Fade support (configurable in settings)
-- Full mouse support (click to select, scroll to navigate, click the progress bar to seek)
-- [ARL login](https://www.dumpmedia.com/deezplus/deezer-arl.html#part2)
-
-## Language
-
-The interface ships with **English** (default) and **French** translations.
-On first run you'll be asked to pick your language before the ARL setup; you
-can switch it at any time from **Settings → Language**. The translation layer
-is embedded in the binary, so it adds no runtime memory cost.
+    Mouse      Click to select, scroll to navigate, click progress bar to seek
+    Arrow Keys Navigate
+    TAB        Switch focus
+    Enter      Select
+    P          Play / Pause
+    /          Search
+    T          Cycle themes
+    Q          Quit
 
 ## Getting your Deezer ARL
 
-The app authenticates with your Deezer account using an **ARL** cookie. To get
-it:
+The app authenticates with your Deezer account using an **ARL** cookie:
 
 1. Log in to [deezer.com](https://www.deezer.com) in your browser.
 2. Open **DevTools** (`F12`).
-3. Go to **Application** (or **Storage**) → **Cookies** → `https://www.deezer.com`.
-4. Find the cookie named `arl` and copy its value (a long hex string).
+3. Go to **Application** → **Cookies** → `https://www.deezer.com`.
+4. Copy the value of the cookie named `arl`.
 
-The app will prompt you for this value on first launch. It is stored locally in
+You'll be prompted for it on first launch. It's stored locally in
 `~/.deezer-tui-config.json` and never leaves your machine.
 
-## Installation
+## Credits
 
-<details>
-<summary><b>Arch Based (AUR)</b></summary>
-<br>
+Fork of [deezer-tui](https://github.com/Minuga-RC/deezer-tui) by
+[Minuga-RC](https://github.com/Minuga-RC). This fork adds:
 
-Available in the AUR as `deezer-tui-bin`. You can install it using your favorite AUR helper like `paru` or `yay`:
-
-```bash
-paru -S deezer-tui-bin
-```
-
-</details>
-
-<details>
-<summary><b>Ubuntu & Debian</b></summary>
-
-    Head over to the (Releases page)[https://github.com/Minuga-RC/deezer-tui/releases] and download the latest .deb file.
-
-    Open your terminal in your downloads folder and run:
-
-Bash
-
-sudo apt install ./deezer-tui_*_amd64.deb
-
-</details>
-
-<details>
-<summary><b>Other Linux (Standalone Binary)</b></summary>
-
-If you aren't on Arch or Debian, you can just grab the pre-compiled binary from the Releases page, make it executable, and run it directly!
-
-</details>
-
-## Pick Up This Project
-
-Since I originally made this just to fit my own needs, I don't plan on actively maintaining or expanding it. If you stumble across this and want to pick up the project, clean up the code, or add new features please do!
+- Internationalization (English & French)
+- Full mouse support and general UX polish

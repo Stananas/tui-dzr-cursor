@@ -1005,6 +1005,7 @@ async fn run_tui_loop(
                     app.status_message = message;
                 }
                 UiEvent::Error(message) => {
+                    let message = friendly_error(app.i18n, message);
                     let is_status_message = message.starts_with("Status:")
                         || message.contains("Loading")
                         || message.contains("Auth")
@@ -1150,6 +1151,15 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> An
         .context("failed to leave alternate screen")?;
     terminal.show_cursor().context("failed to restore cursor")?;
     Ok(())
+}
+
+/// Translate technical Deezer API errors into user-friendly messages.
+fn friendly_error(i18n: &L10n, message: String) -> String {
+    if message.contains("missing signed source URL") {
+        i18n.error_track_unavailable.to_string()
+    } else {
+        message
+    }
 }
 
 /// Run Enter on the app and apply any side effects that need external

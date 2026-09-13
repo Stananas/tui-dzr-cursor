@@ -82,6 +82,7 @@ pub struct L10n {
     pub theme_label: &'static str,
     pub playing_queue_item: &'static str,
     pub crossfading_item: &'static str,
+    pub error_track_unavailable: &'static str,
     // First-run setup
     pub setup_language_title: &'static str,
     pub setup_language_hint: &'static str,
@@ -313,6 +314,7 @@ pub static FR: L10n = L10n {
     theme_label: "Thème",
     playing_queue_item: "Lecture de l'élément",
     crossfading_item: "Fondu vers l'élément",
+    error_track_unavailable: "Piste indisponible (lecture bloquée dans votre région)",
     setup_language_title: "Choisissez votre langue / Choose your language:",
     setup_language_hint: "Entrez 1 pour Français, 2 pour English, puis Entrée.",
     setup_language_choice: "Votre choix [1-2]",
@@ -398,6 +400,7 @@ pub static EN: L10n = L10n {
     theme_label: "Theme",
     playing_queue_item: "Playing queue item",
     crossfading_item: "Crossfading to queue item",
+    error_track_unavailable: "Track unavailable (playback blocked in your region)",
     setup_language_title: "Choose your language:",
     setup_language_hint: "Enter 1 for Français, 2 for English, then press Enter.",
     setup_language_choice: "Your choice [1-2]",

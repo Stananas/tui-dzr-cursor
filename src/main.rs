@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod crypto;
 mod discord_rpc;
+mod i18n;
 mod mpris;
 mod player;
 mod ui;
@@ -22,19 +23,25 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, Context, Result as AnyResult};
 use base64::Engine;
-use app::{ActivePanel, App, Command, NowPlaying, RepeatMode, SearchCategory, UiEvent};
-use config::{AudioQuality, Config, Theme};
+use app::{
+    ActivePanel, App, ClickAction, Command, EnterOutcome, NowPlaying, RepeatMode, SearchCategory,
+    UiEvent,
+};
+use config::{AudioQuality, Config, Language};
 use discord_rpc::{DiscordPresence, DiscordRpcHandle};
+use i18n::{L10n, EN, FR};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEvent,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
+    layout::{Position, Rect},
+    widgets::ListState,
     Terminal,
 };
 use rand::seq::SliceRandom;
@@ -254,17 +261,6 @@ enum PlayerControl {
     SetVolume(f32),
 }
 
-fn next_quality(current: AudioQuality, forward: bool) -> AudioQuality {
-    match (current, forward) {
-        (AudioQuality::Kbps128, true) => AudioQuality::Kbps320,
-        (AudioQuality::Kbps320, true) => AudioQuality::Flac,
-        (AudioQuality::Flac, true) => AudioQuality::Kbps128,
-        (AudioQuality::Kbps128, false) => AudioQuality::Flac,
-        (AudioQuality::Kbps320, false) => AudioQuality::Kbps128,
-        (AudioQuality::Flac, false) => AudioQuality::Kbps320,
-    }
-}
-
 fn sync_discord_presence(discord_rpc: &DiscordRpcHandle, app: &App) {
     if !app.discord_rpc_enabled {
         discord_rpc.clear();
@@ -323,13 +319,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let _ = playlists_event_tx.send(UiEvent::Error("Status: Initializing...".into()));
+        let _ = playlists_event_tx.send(UiEvent::Status("Status: Initializing...".into()));
 
         match DeezerClient::new(arl) {
             Ok(mut client) => {
                 match client.fetch_api_token().await {
                     Ok(_) => {
-                        let _ = playlists_event_tx.send(UiEvent::Error("Status: Auth success, fetching playlists...".into()));
+                        let _ = playlists_event_tx.send(UiEvent::Status("Status: Auth success, fetching playlists...".into()));
                         
                         if let Some(user_id) = client.user_id() {
                             match client.fetch_user_playlists(user_id).await {
@@ -355,7 +351,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut audio_task = Some(tokio::spawn(audio_worker_loop(command_rx, event_tx)));
+    let mut audio_task = Some(tokio::spawn(audio_worker_loop(
+        command_rx,
+        event_tx,
+        app.i18n,
+    )));
     // Sync worker's current_quality with the loaded config
     let _ = app.command_sender.send(Command::SetQuality(initial_quality));
     let _ = app.command_sender.send(Command::SetCrossfade {
@@ -468,8 +468,7 @@ async fn run_tui_loop(
                                 app.queue_index = Some(next_idx);
                                 app.queue_state.select(Some(next_idx));
                                 app.auto_transition_armed = true;
-                                app.status_message = format!(
-                                    "Crossfading to queue item {}/{}",
+                                app.status_message = app.i18n.crossfading_item(
                                     next_idx + 1,
                                     app.queue_tracks.len()
                                 );
@@ -591,7 +590,7 @@ async fn run_tui_loop(
                             if let Some(i) = app.queue_index {
                                 app.queue_state.select(Some(i));
                             }
-                            app.status_message = "Queue shuffled".into();
+                            app.status_message = app.i18n.queue_shuffled.into();
                         }
                     }
                     mpris::MprisEvent::SetLoopStatus(loop_status) => {
@@ -734,7 +733,7 @@ async fn run_tui_loop(
                             app.command_sender
                                 .send(Command::Search(app.search_query.clone()))
                                 .map_err(|_| anyhow!("failed to send search command"))?;
-                            app.status_message = "Searching...".into();
+                            app.status_message = app.i18n.searching.into();
                         }
                         KeyCode::Char('/') if !app.is_searching => {
                             app.is_searching = true;
@@ -742,10 +741,9 @@ async fn run_tui_loop(
                             app.search_query.clear();
                         }
                         KeyCode::Char('t') if !app.is_searching => {
-                            app.config.theme = match app.config.theme {
-                                Theme::SpotifyDark => Theme::NcmpcppBlue,
-                                Theme::NcmpcppBlue => Theme::SpotifyDark,
-                            };
+                            app.config.theme = app.config.theme.next();
+                            let _ = save_config(&app.config);
+                            app.status_message = app.i18n.theme_switched(&format!("{:?}", app.config.theme));
                         }
                         KeyCode::Char('p') if !app.is_searching => {
                             if app.now_playing.is_none() {
@@ -781,7 +779,7 @@ async fn run_tui_loop(
                             if app.active_panel == ActivePanel::PlayerProgress {
                                 if let Some(now) = app.now_playing.as_ref() {
                                     if now.quality == AudioQuality::Flac {
-                                        app.status_message = "FLAC seek is disabled".into();
+                                        app.status_message = app.i18n.flac_seek_disabled.into();
                                         continue;
                                     }
                                     let seek_ms = now.current_ms.saturating_sub(5_000);
@@ -795,36 +793,13 @@ async fn run_tui_loop(
                                     if let Some(mpris_handle) = mpris.as_mut() {
                                         mpris::notify_seeked(&mpris_handle.server, seek_ms).await;
                                     }
-                                    app.status_message = format!("Seek: {}s", seek_ms / 1000);
+                                    app.status_message = app.i18n.seek(seek_ms / 1000);
                                 }
                             } else if app.active_panel == ActivePanel::PlayerInfo {
-                                match app.player_info_index {
-                                    0 => {
-                                        app.volume = app.volume.saturating_sub(5);
-                                        app.command_sender
-                                            .send(Command::SetVolume(app.volume))
-                                            .map_err(|_| anyhow!("failed to set volume"))?;
-                                    }
-                                    1 => {
-                                        if let Some(now) = app.now_playing.as_ref() {
-                                            let quality = next_quality(now.quality, false);
-                                            let seek_ms = if quality == AudioQuality::Flac {
-                                                0
-                                            } else {
-                                                now.current_ms
-                                            };
-                                            app.command_sender
-                                                .send(Command::PlayTrackAt {
-                                                    track_id: now.id.clone(),
-                                                    quality,
-                                                    seek_ms,
-                                                })
-                                                .map_err(|_| anyhow!("failed to switch quality"))?;
-                                            app.status_message = format!("Quality: {:?}", quality);
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                                app.volume = app.volume.saturating_sub(5);
+                                app.command_sender
+                                    .send(Command::SetVolume(app.volume))
+                                    .map_err(|_| anyhow!("failed to set volume"))?;
                             } else {
                                 app.handle_left();
                             }
@@ -835,7 +810,7 @@ async fn run_tui_loop(
                             } else if app.active_panel == ActivePanel::PlayerProgress {
                                 if let Some(now) = app.now_playing.as_ref() {
                                     if now.quality == AudioQuality::Flac {
-                                        app.status_message = "FLAC seek is disabled".into();
+                                        app.status_message = app.i18n.flac_seek_disabled.into();
                                         continue;
                                     }
                                     let seek_ms = (now.current_ms + 5_000).min(now.total_ms.saturating_sub(1));
@@ -849,356 +824,24 @@ async fn run_tui_loop(
                                     if let Some(mpris_handle) = mpris.as_mut() {
                                         mpris::notify_seeked(&mpris_handle.server, seek_ms).await;
                                     }
-                                    app.status_message = format!("Seek: {}s", seek_ms / 1000);
+                                    app.status_message = app.i18n.seek(seek_ms / 1000);
                                 }
                             } else if app.active_panel == ActivePanel::PlayerInfo {
-                                match app.player_info_index {
-                                    0 => {
-                                        app.volume = (app.volume + 5).min(100);
-                                        app.command_sender
-                                            .send(Command::SetVolume(app.volume))
-                                            .map_err(|_| anyhow!("failed to set volume"))?;
-                                    }
-                                    1 => {
-                                        if let Some(now) = app.now_playing.as_ref() {
-                                            let quality = next_quality(now.quality, true);
-                                            let seek_ms = if quality == AudioQuality::Flac {
-                                                0
-                                            } else {
-                                                now.current_ms
-                                            };
-                                            app.command_sender
-                                                .send(Command::PlayTrackAt {
-                                                    track_id: now.id.clone(),
-                                                    quality,
-                                                    seek_ms,
-                                                })
-                                                .map_err(|_| anyhow!("failed to switch quality"))?;
-                                            app.status_message = format!("Quality: {:?}", quality);
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                                app.volume = (app.volume + 5).min(100);
+                                app.command_sender
+                                    .send(Command::SetVolume(app.volume))
+                                    .map_err(|_| anyhow!("failed to set volume"))?;
                             } else {
                                 app.handle_right();
                             }
                         }
                         KeyCode::Enter if !app.is_searching => {
-                            match app.active_panel {
-                                ActivePanel::Navigation => {
-                                    let nav_idx = app.nav_state.selected().unwrap_or(0);
-                                    match nav_idx {
-                                        0 => {
-                                            app.command_sender
-                                                .send(Command::LoadHome)
-                                                .map_err(|_| anyhow!("failed to send load home command"))?;
-                                            app.current_playlist_id = Some("__home__".to_string());
-                                            app.active_panel = ActivePanel::Main;
-                                            app.status_message = "Loading Home recommendations...".into();
-                                        }
-                                        1 => {
-                                            app.command_sender
-                                                .send(Command::LoadExplore)
-                                                .map_err(|_| anyhow!("failed to send load explore command"))?;
-                                            app.current_playlist_id = Some("__explore__".to_string());
-                                            app.active_panel = ActivePanel::Main;
-                                            app.status_message = "Loading Explore recommendations...".into();
-                                        }
-                                        2 => {
-                                            app.command_sender
-                                                .send(Command::LoadFavorites)
-                                                .map_err(|_| anyhow!("failed to send load favorites command"))?;
-                                            app.active_panel = ActivePanel::Main;
-                                            app.status_message = "Loading favorites...".into();
-                                        }
-                                        3 => {
-                                            app.viewing_settings = true;
-                                            app.active_panel = ActivePanel::Main;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                ActivePanel::Playlists => {
-                                    if let Some(idx) = app.playlist_state.selected() {
-                                        if idx < app.playlists.len() {
-                                            let (playlist_id, _) = &app.playlists[idx];
-                                            app.current_playlist_id = Some(playlist_id.clone());
-                                            app.command_sender
-                                                .send(Command::LoadPlaylist(playlist_id.clone()))
-                                                .map_err(|_| anyhow!("failed to send load playlist command"))?;
-                                            app.active_panel = ActivePanel::Main;
-                                        }
-                                    }
-                                }
-                                ActivePanel::Queue => {
-                                    if let Some(idx) = app.queue_state.selected() {
-                                        if idx < app.queue_tracks.len() {
-                                            app.queue_index = Some(idx);
-                                            let (track_id, _, _) = &app.queue_tracks[idx];
-                                            app.command_sender
-                                                .send(Command::PlayTrack(track_id.clone()))
-                                                .map_err(|_| anyhow!("failed to play queued track"))?;
-                                            app.is_playing = true;
-                                        }
-                                    }
-                                }
-                                ActivePanel::Main => {
-                                    if app.viewing_settings {
-                                        if let Some(idx) = app.settings_state.selected() {
-                                            match idx {
-                                                0 => {
-                                                    app.config.crossfade_enabled = !app.config.crossfade_enabled;
-                                                    app.command_sender
-                                                        .send(Command::SetCrossfade {
-                                                            enabled: app.config.crossfade_enabled,
-                                                            duration_ms: app.config.crossfade_duration_ms,
-                                                        })
-                                                        .map_err(|_| anyhow!("failed to set crossfade"))?;
-                                                    let _ = save_config(&app.config);
-                                                }
-                                                1 => {
-                                                    let presets = [1000u64, 3000, 5000, 8000, 10000, 13000];
-                                                    let current = app.config.crossfade_duration_ms;
-                                                    let next = presets
-                                                        .iter()
-                                                        .copied()
-                                                        .find(|value| *value > current)
-                                                        .unwrap_or(presets[0]);
-                                                    app.config.crossfade_duration_ms = next;
-                                                    app.command_sender
-                                                        .send(Command::SetCrossfade {
-                                                            enabled: app.config.crossfade_enabled,
-                                                            duration_ms: app.config.crossfade_duration_ms,
-                                                        })
-                                                        .map_err(|_| anyhow!("failed to set crossfade duration"))?;
-                                                    let _ = save_config(&app.config);
-                                                }
-                                                2 => {
-                                                    app.config.default_quality = match app.config.default_quality {
-                                                        AudioQuality::Kbps128 => AudioQuality::Kbps320,
-                                                        AudioQuality::Kbps320 => AudioQuality::Flac,
-                                                        AudioQuality::Flac => AudioQuality::Kbps128,
-                                                    };
-                                                    app.command_sender
-                                                        .send(Command::SetQuality(app.config.default_quality))
-                                                        .map_err(|_| anyhow!("failed to set quality"))?;
-                                                    let _ = save_config(&app.config);
-                                                }
-                                                3 => {
-                                                    app.discord_rpc_enabled = !app.discord_rpc_enabled;
-                                                    app.config.discord_rpc_enabled = app.discord_rpc_enabled;
-                                                    let _ = save_config(&app.config);
-                                                    sync_discord_presence(discord_rpc, app);
-                                                }
-                                                4 => {
-                                                    let new_arl = app.search_query.trim();
-                                                    if new_arl.is_empty() {
-                                                        app.status_message = "Type new ARL in search box first".into();
-                                                    } else if let Err(err) = save_arl(new_arl) {
-                                                        app.status_message = format!("Failed to save ARL: {}", err);
-                                                    } else {
-                                                        app.status_message = "ARL updated".into();
-                                                        app.search_query.clear();
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    } else if app.showing_search_results {
-                                        if let Some(idx) = app.main_state.selected() {
-                                            match app.search_category {
-                                                SearchCategory::Tracks => {
-                                                    if idx == 0 {
-                                                        app.queue_tracks = app.current_tracks.clone();
-                                                        app.queue = app
-                                                            .queue_tracks
-                                                            .iter()
-                                                            .map(|(_, title, artist)| format!("{} - {}", title, artist))
-                                                            .collect();
-                                                        app.queue_state.select(Some(0));
-                                                        app.queue_index = Some(0);
-
-                                                        if let Some((track_id, _, _)) = app.queue_tracks.first() {
-                                                            app.command_sender
-                                                                .send(Command::PlayTrack(track_id.clone()))
-                                                                .map_err(|_| anyhow!("failed to send play track command"))?;
-                                                            app.is_playing = true;
-                                                        }
-                                                    } else {
-                                                        let track_idx = idx - 1;
-                                                        if track_idx < app.current_tracks.len() {
-                                                            let selected = app.current_tracks[track_idx].clone();
-                                                            app.queue_tracks = vec![selected.clone()];
-                                                            app.queue = vec![format!("{} - {}", selected.1, selected.2)];
-                                                            app.queue_state.select(Some(0));
-                                                            app.queue_index = Some(0);
-
-                                                            app.command_sender
-                                                                .send(Command::PlayTrack(selected.0))
-                                                                .map_err(|_| anyhow!("failed to send play track command"))?;
-                                                            app.is_playing = true;
-                                                        }
-                                                    }
-                                                }
-                                                SearchCategory::Playlists => {
-                                                    if idx < app.search_playlists.len() {
-                                                        let (playlist_id, title) = &app.search_playlists[idx];
-                                                        app.current_playlist_id = Some(playlist_id.clone());
-                                                        app.command_sender
-                                                            .send(Command::LoadPlaylist(playlist_id.clone()))
-                                                            .map_err(|_| anyhow!("failed to load playlist from search"))?;
-                                                        app.status_message = format!("Loading playlist: {}", title);
-                                                    }
-                                                }
-                                                SearchCategory::Artists => {
-                                                    if idx < app.search_artists.len() {
-                                                        let (_, name) = &app.search_artists[idx];
-                                                        app.command_sender
-                                                            .send(Command::Search(name.clone()))
-                                                            .map_err(|_| anyhow!("failed to search artist"))?;
-                                                        app.status_message = format!("Searching artist: {}", name);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else if !app.current_tracks.is_empty() {
-                                        if let Some(idx) = app.main_state.selected() {
-                                            if idx == 0 {
-                                                app.queue_tracks = app.current_tracks.clone();
-                                                app.queue = app
-                                                    .queue_tracks
-                                                    .iter()
-                                                    .map(|(_, title, artist)| format!("{} - {}", title, artist))
-                                                    .collect();
-                                                app.queue_state.select(Some(0));
-                                                app.queue_index = Some(0);
-
-                                                if let Some((track_id, _, _)) = app.queue_tracks.first() {
-                                                    app.command_sender
-                                                        .send(Command::PlayTrack(track_id.clone()))
-                                                        .map_err(|_| anyhow!("failed to send play track command"))?;
-                                                    app.is_playing = true;
-                                                }
-                                            } else {
-                                                let track_idx = idx - 1;
-                                                if track_idx < app.current_tracks.len() {
-                                                    let selected = app.current_tracks[track_idx].clone();
-                                                    app.queue_tracks = vec![selected.clone()];
-                                                    app.queue = vec![format!("{} - {}", selected.1, selected.2)];
-                                                    app.queue_state.select(Some(0));
-                                                    app.queue_index = Some(0);
-
-                                                    app.command_sender
-                                                        .send(Command::PlayTrack(selected.0))
-                                                        .map_err(|_| anyhow!("failed to send play track command"))?;
-                                                    app.is_playing = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ActivePanel::Player => {
-                                    match app.player_button_index {
-                                        0 => {
-                                            if !app.queue_tracks.is_empty() {
-                                                let current_id = app
-                                                    .queue_index
-                                                    .and_then(|i| app.queue_tracks.get(i))
-                                                    .map(|t| t.0.clone());
-                                                app.queue_tracks.shuffle(&mut thread_rng());
-                                                if let Some(current) = current_id {
-                                                    app.queue_index = app
-                                                        .queue_tracks
-                                                        .iter()
-                                                        .position(|t| t.0 == current);
-                                                }
-                                                app.queue = app
-                                                    .queue_tracks
-                                                    .iter()
-                                                    .map(|(_, title, artist)| format!("{} - {}", title, artist))
-                                                    .collect();
-                                                if let Some(i) = app.queue_index {
-                                                    app.queue_state.select(Some(i));
-                                                }
-                                                app.status_message = "Queue shuffled".into();
-                                            }
-                                        }
-                                        1 => {
-                                            if let Some(current_idx) = app.queue_index {
-                                                if current_idx > 0 {
-                                                    let prev_idx = current_idx - 1;
-                                                    app.queue_index = Some(prev_idx);
-                                                    app.queue_state.select(Some(prev_idx));
-                                                    if let Some((track_id, _, _)) = app.queue_tracks.get(prev_idx) {
-                                                        app.command_sender
-                                                            .send(Command::PlayTrack(track_id.clone()))
-                                                            .map_err(|_| anyhow!("failed to play previous track"))?;
-                                                        app.is_playing = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        2 => {
-                                            if app.is_playing {
-                                                app.command_sender
-                                                    .send(Command::Pause)
-                                                    .map_err(|_| anyhow!("failed to pause"))?;
-                                            } else {
-                                                app.command_sender
-                                                    .send(Command::Resume)
-                                                    .map_err(|_| anyhow!("failed to resume"))?;
-                                            }
-                                        }
-                                        3 => {
-                                            if let Some(current_idx) = app.queue_index {
-                                                let next_idx = current_idx + 1;
-                                                if next_idx < app.queue_tracks.len() {
-                                                    app.queue_index = Some(next_idx);
-                                                    app.queue_state.select(Some(next_idx));
-                                                    if let Some((track_id, _, _)) = app.queue_tracks.get(next_idx) {
-                                                        app.command_sender
-                                                            .send(Command::PlayTrack(track_id.clone()))
-                                                            .map_err(|_| anyhow!("failed to play next track"))?;
-                                                        app.is_playing = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        4 => {
-                                            app.repeat_mode = match app.repeat_mode {
-                                                RepeatMode::Off => RepeatMode::All,
-                                                RepeatMode::All => RepeatMode::One,
-                                                RepeatMode::One => RepeatMode::Off,
-                                            };
-                                            if let Some(mpris_handle) = mpris.as_mut() {
-                                                let loop_status = match app.repeat_mode {
-                                                    RepeatMode::Off => LoopStatus::None,
-                                                    RepeatMode::One => LoopStatus::Track,
-                                                    RepeatMode::All => LoopStatus::Playlist,
-                                                };
-                                                mpris::update_loop_and_shuffle(&mpris_handle.server, loop_status, false).await;
-                                            }
-                                            app.status_message = format!("Repeat mode: {:?}", app.repeat_mode);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                ActivePanel::Search => {
-                                    app.command_sender
-                                        .send(Command::Search(app.search_query.clone()))
-                                        .map_err(|_| anyhow!("failed to send search command"))?;
-                                    app.active_panel = ActivePanel::Main;
-                                }
-                                ActivePanel::PlayerProgress => {
-                                    // Progress bar uses Left/Right for seek; Enter is a no-op.
-                                }
-                                ActivePanel::PlayerInfo => {}
-                            }
+                            do_enter(app, mpris.as_mut()).await?;
                         }
                         _ => {}
                     }
                 }
-                Event::Mouse(mouse_event) => handle_mouse_event(mouse_event),
+                Event::Mouse(mouse_event) => handle_mouse_event(mouse_event, app, mpris.as_mut()).await?,
                 Event::Resize(_, _) => {
                     // Resize often cleans up stray lines, keep that behavior explicit.
                     force_full_redraw = true;
@@ -1306,8 +949,7 @@ async fn run_tui_loop(
                                     .send(Command::AutoPlayTrack(next_track_id.clone()))
                                     .map_err(|_| anyhow!("failed to send next queued track command"))?;
                                 app.is_playing = true;
-                                app.status_message = format!(
-                                    "Playing queue item {}/{}",
+                                app.status_message = app.i18n.playing_item(
                                     next_idx + 1,
                                     app.queue_tracks.len()
                                 );
@@ -1335,7 +977,7 @@ async fn run_tui_loop(
                                 RepeatMode::Off => {
                                     app.queue_index = None;
                                     app.is_playing = false;
-                                    app.status_message = "Queue finished".into();
+                                    app.status_message = app.i18n.queue_finished.into();
                                     if let Some(mpris_handle) = mpris.as_mut() {
                                         mpris::set_playback_status(&mpris_handle.server, PlaybackStatus::Stopped, 0).await;
                                     }
@@ -1344,7 +986,7 @@ async fn run_tui_loop(
                         } else {
                             app.queue_index = None;
                             app.is_playing = false;
-                            app.status_message = "Queue finished".into();
+                            app.status_message = app.i18n.queue_finished.into();
                             if let Some(mpris_handle) = mpris.as_mut() {
                                 mpris::set_playback_status(&mpris_handle.server, PlaybackStatus::Stopped, 0).await;
                             }
@@ -1358,6 +1000,9 @@ async fn run_tui_loop(
                     if !app.is_playing {
                         discord_rpc.clear();
                     }
+                }
+                UiEvent::Status(message) => {
+                    app.status_message = message;
                 }
                 UiEvent::Error(message) => {
                     let is_status_message = message.starts_with("Status:")
@@ -1436,7 +1081,7 @@ async fn run_tui_loop(
                 }
                 UiEvent::PlaylistsLoaded(playlists) => {
                     app.playlists = playlists;
-                    app.status_message = "Playlists loaded!".into();
+                    app.status_message = app.i18n.playlists_loaded.into();
                     if !app.playlists.is_empty() {
                         app.playlist_state.select(Some(0));
                     }
@@ -1447,9 +1092,9 @@ async fn run_tui_loop(
                     app.search_playlists.clear();
                     app.search_artists.clear();
                     if app.current_tracks.is_empty() {
-                        app.status_message = "No tracks found for this playlist/search".into();
+                        app.status_message = app.i18n.no_tracks_found.into();
                     } else {
-                        app.status_message = format!("Loaded {} tracks", app.current_tracks.len());
+                        app.status_message = app.i18n.loaded_tracks(app.current_tracks.len());
                     }
                     app.main_state.select(Some(0));
                     app.viewing_settings = false;
@@ -1468,8 +1113,7 @@ async fn run_tui_loop(
                     app.main_state.select(Some(0));
                     app.viewing_settings = false;
                     app.active_panel = ActivePanel::Main;
-                    app.status_message = format!(
-                        "Search: {} tracks, {} playlists, {} artists",
+                    app.status_message = app.i18n.search_title(
                         app.current_tracks.len(),
                         app.search_playlists.len(),
                         app.search_artists.len()
@@ -1508,22 +1152,255 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> An
     Ok(())
 }
 
-fn handle_mouse_event(mouse_event: MouseEvent) {
-    match mouse_event.kind {
-        MouseEventKind::Down(_) => {}
-        MouseEventKind::Up(_) => {}
-        MouseEventKind::Drag(_) => {}
-        MouseEventKind::Moved => {}
-        MouseEventKind::ScrollDown => {}
-        MouseEventKind::ScrollUp => {}
-        MouseEventKind::ScrollLeft => {}
-        MouseEventKind::ScrollRight => {}
+/// Run Enter on the app and apply any side effects that need external
+/// resources (config persistence, MPRIS). Shared by keyboard and mouse paths.
+async fn do_enter(app: &mut App, mpris: Option<&mut MprisHandle>) -> AnyResult<()> {
+    let outcome = app.handle_enter()?;
+    match outcome {
+        EnterOutcome::SaveConfig => {
+            let _ = save_config(&app.config);
+        }
+        EnterOutcome::MprisLoopUpdate(loop_status) => {
+            if let Some(mpris_handle) = mpris {
+                mpris::update_loop_and_shuffle(&mpris_handle.server, loop_status, false).await;
+            }
+        }
+        EnterOutcome::None => {}
     }
+    Ok(())
+}
+
+/// Row index of the item under the mouse cursor inside a list widget.
+/// `rect` is the full block area; content starts one row down (the top
+/// border). The list blocks only pad horizontally, never vertically.
+fn list_index_at(
+    state: &ListState,
+    rect: Rect,
+    col: u16,
+    row: u16,
+    count: usize,
+) -> Option<usize> {
+    if count == 0 || !rect.contains(Position::new(col, row)) {
+        return None;
+    }
+    let top = rect.y as usize + 1;
+    if (row as usize) < top {
+        return None;
+    }
+    let idx = state.offset() + (row as usize - top);
+    (idx < count).then_some(idx)
+}
+
+/// Number of selectable rows in the main list, depending on the current view.
+fn main_item_count(app: &App) -> usize {
+    if app.showing_search_results {
+        match app.search_category {
+            SearchCategory::Tracks => app.current_tracks.len() + 1,
+            SearchCategory::Playlists => app.search_playlists.len(),
+            SearchCategory::Artists => app.search_artists.len(),
+        }
+    } else if !app.current_tracks.is_empty() {
+        app.current_tracks.len() + 1
+    } else {
+        0
+    }
+}
+
+async fn seek_to_click(
+    app: &mut App,
+    mpris: Option<&mut MprisHandle>,
+    rect: Rect,
+    col: u16,
+) -> AnyResult<()> {
+    let Some(now) = app.now_playing.as_ref() else {
+        return Ok(());
+    };
+    if now.quality == AudioQuality::Flac {
+        app.status_message = app.i18n.flac_seek_disabled.into();
+        return Ok(());
+    }
+    if rect.width == 0 {
+        return Ok(());
+    }
+    let rel_x = col.saturating_sub(rect.x);
+    let frac = (rel_x as f64 / rect.width as f64).clamp(0.0, 1.0);
+    let seek_ms = ((now.total_ms.saturating_sub(1)) as f64 * frac) as u64;
+    let track_id = now.id.clone();
+    let quality = now.quality;
+    app.command_sender
+        .send(Command::PlayTrackAt {
+            track_id,
+            quality,
+            seek_ms,
+        })
+        .map_err(|_| anyhow!("failed to seek track"))?;
+    if let Some(mpris_handle) = mpris {
+        mpris::notify_seeked(&mpris_handle.server, seek_ms).await;
+    }
+    app.status_message = app.i18n.seek(seek_ms / 1000);
+    Ok(())
+}
+
+fn scroll_at(app: &mut App, col: u16, row: u16, up: bool) {
+    let Some(region) = app
+        .click_regions
+        .iter()
+        .find(|r| r.rect.contains(Position::new(col, row)))
+        .copied()
+    else {
+        return;
+    };
+    match region.action {
+        ClickAction::NavList => {
+            app.active_panel = ActivePanel::Navigation;
+            if up {
+                app.handle_up();
+            } else {
+                app.handle_down();
+            }
+        }
+        ClickAction::PlaylistList => {
+            app.active_panel = ActivePanel::Playlists;
+            if up {
+                app.handle_up();
+            } else {
+                app.handle_down();
+            }
+        }
+        ClickAction::QueueList => {
+            app.active_panel = ActivePanel::Queue;
+            if up {
+                app.handle_up();
+            } else {
+                app.handle_down();
+            }
+        }
+        ClickAction::MainList | ClickAction::SettingsList => {
+            app.active_panel = ActivePanel::Main;
+            if up {
+                app.handle_up();
+            } else {
+                app.handle_down();
+            }
+        }
+        ClickAction::PlayerButton(_) => {
+            app.active_panel = ActivePanel::Player;
+            if up {
+                app.player_button_index = app.player_button_index.saturating_sub(1);
+            } else if app.player_button_index < 4 {
+                app.player_button_index += 1;
+            } else {
+                app.active_panel = ActivePanel::PlayerInfo;
+            }
+        }
+        ClickAction::VolumeLine => {
+            app.active_panel = ActivePanel::PlayerInfo;
+            let volume = if up {
+                app.volume.saturating_sub(5)
+            } else {
+                (app.volume + 5).min(100)
+            };
+            app.volume = volume;
+            let _ = app.command_sender.send(Command::SetVolume(volume));
+        }
+        _ => {}
+    }
+}
+
+async fn handle_mouse_event(
+    mouse_event: MouseEvent,
+    app: &mut App,
+    mpris: Option<&mut MprisHandle>,
+) -> AnyResult<()> {
+    let (col, row) = (mouse_event.column, mouse_event.row);
+    match mouse_event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(region) = app
+                .click_regions
+                .iter()
+                .find(|r| r.rect.contains(Position::new(col, row)))
+                .copied()
+            else {
+                return Ok(());
+            };
+            match region.action {
+                ClickAction::NavList => {
+                    if let Some(idx) =
+                        list_index_at(&app.nav_state, region.rect, col, row, 4)
+                    {
+                        app.nav_state.select(Some(idx));
+                        app.active_panel = ActivePanel::Navigation;
+                        do_enter(app, mpris).await?;
+                    }
+                }
+                ClickAction::PlaylistList => {
+                    if let Some(idx) =
+                        list_index_at(&app.playlist_state, region.rect, col, row, app.playlists.len())
+                    {
+                        app.playlist_state.select(Some(idx));
+                        app.active_panel = ActivePanel::Playlists;
+                        do_enter(app, mpris).await?;
+                    }
+                }
+                ClickAction::QueueList => {
+                    if let Some(idx) = list_index_at(
+                        &app.queue_state,
+                        region.rect,
+                        col,
+                        row,
+                        app.queue_tracks.len(),
+                    ) {
+                        app.queue_state.select(Some(idx));
+                        app.active_panel = ActivePanel::Queue;
+                        do_enter(app, mpris).await?;
+                    }
+                }
+                ClickAction::MainList => {
+                    if let Some(idx) =
+                        list_index_at(&app.main_state, region.rect, col, row, main_item_count(app))
+                    {
+                        app.main_state.select(Some(idx));
+                        app.active_panel = ActivePanel::Main;
+                        do_enter(app, mpris).await?;
+                    }
+                }
+                ClickAction::SettingsList => {
+                    if let Some(idx) =
+                        list_index_at(&app.settings_state, region.rect, col, row, 6)
+                    {
+                        app.settings_state.select(Some(idx));
+                        app.active_panel = ActivePanel::Main;
+                        do_enter(app, mpris).await?;
+                    }
+                }
+                ClickAction::SearchBox => {
+                    app.active_panel = ActivePanel::Search;
+                    app.is_searching = true;
+                }
+                ClickAction::PlayerButton(i) => {
+                    app.active_panel = ActivePanel::Player;
+                    app.player_button_index = i;
+                    do_enter(app, mpris).await?;
+                }
+                ClickAction::SeekBar => {
+                    seek_to_click(app, mpris, region.rect, col).await?;
+                }
+                ClickAction::VolumeLine => {
+                    app.active_panel = ActivePanel::PlayerInfo;
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => scroll_at(app, col, row, false),
+        MouseEventKind::ScrollUp => scroll_at(app, col, row, true),
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn audio_worker_loop(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<UiEvent>,
+    i18n: &'static L10n,
 ) {
     let mut active_controls: Option<std::sync::mpsc::Sender<PlayerControl>> = None;
     let mut active_playback_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1715,7 +1592,7 @@ async fn audio_worker_loop(
             }
             Command::LoadPlaylist(playlist_id) => {
                 let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading tracks...".into()));
+                let _ = event_tx_for_task.send(UiEvent::Status(i18n.loading_tracks.to_string()));
                 
                 tokio::spawn(async move {
                     use api::DeezerClient;
@@ -1754,7 +1631,7 @@ async fn audio_worker_loop(
             }
             Command::LoadHome => {
                 let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading Home recommendations...".into()));
+                let _ = event_tx_for_task.send(UiEvent::Status(i18n.loading_home.to_string()));
 
                 tokio::spawn(async move {
                     use api::DeezerClient;
@@ -1823,7 +1700,7 @@ async fn audio_worker_loop(
             }
             Command::LoadExplore => {
                 let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading Explore recommendations...".into()));
+                let _ = event_tx_for_task.send(UiEvent::Status(i18n.loading_explore.to_string()));
 
                 tokio::spawn(async move {
                     use api::DeezerClient;
@@ -1892,7 +1769,7 @@ async fn audio_worker_loop(
             }
             Command::LoadFavorites => {
                 let event_tx_for_task = event_tx.clone();
-                let _ = event_tx_for_task.send(UiEvent::Error("Status: Loading favorites...".into()));
+                let _ = event_tx_for_task.send(UiEvent::Status(i18n.loading_favorites.to_string()));
 
                 tokio::spawn(async move {
                     use api::DeezerClient;
@@ -2251,8 +2128,9 @@ fn save_arl(arl: &str) -> AnyResult<()> {
     save_config(&config)
 }
 
-fn prompt_for_arl() -> AnyResult<String> {
-    print!("Enter Deezer ARL: ");
+fn prompt_for_arl(i18n: &'static L10n) -> AnyResult<String> {
+    println!("{}", i18n.setup_arl_help);
+    print!("{}: ", i18n.setup_enter_arl);
     io::stdout().flush().context("failed to flush stdout")?;
 
     let mut input = String::new();
@@ -2266,6 +2144,38 @@ fn prompt_for_arl() -> AnyResult<String> {
     }
 
     Ok(arl)
+}
+
+/// First-run language selection. Shown bilingually since no language has been
+/// chosen yet, then persisted to the config.
+fn prompt_for_language() -> AnyResult<Language> {
+    loop {
+        println!("{}", FR.setup_language_title);
+        println!("{}", FR.setup_language_hint);
+        println!();
+        println!("  1) Français");
+        println!("  2) English");
+        println!();
+        print!("{}: ", FR.setup_language_choice);
+        io::stdout().flush().context("failed to flush stdout")?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("failed to read language from stdin")?;
+
+        match input.trim() {
+            "1" => {
+                println!("{}", FR.setup_language_done);
+                return Ok(Language::Fr);
+            }
+            "2" => {
+                println!("{}", EN.setup_language_done);
+                return Ok(Language::En);
+            }
+            _ => println!("{}", FR.setup_language_invalid),
+        }
+    }
 }
 
 async fn verify_arl(arl: &str) -> AnyResult<()> {
@@ -2283,6 +2193,14 @@ async fn verify_arl(arl: &str) -> AnyResult<()> {
 async fn ensure_verified_arl() -> AnyResult<()> {
     let mut config = load_config();
 
+    // First-run setup: ask for the language before anything else.
+    if !config.language_set {
+        config.language = prompt_for_language()?;
+        config.language_set = true;
+        save_config(&config)?;
+    }
+    let i18n = L10n::for_language(config.language);
+
     loop {
         let existing_arl = config.arl.trim().to_owned();
 
@@ -2290,21 +2208,21 @@ async fn ensure_verified_arl() -> AnyResult<()> {
             if verify_arl(&existing_arl).await.is_ok() {
                 return Ok(());
             }
-            println!("Saved ARL is invalid. Please enter a new ARL.");
+            println!("{}", i18n.setup_invalid_arl);
         } else {
-            println!("No ARL found in config. Please enter your Deezer ARL.");
+            println!("{}", i18n.setup_no_arl);
         }
 
-        let entered = prompt_for_arl()?;
+        let entered = prompt_for_arl(i18n)?;
         match verify_arl(&entered).await {
             Ok(_) => {
                 config.arl = entered;
                 save_config(&config)?;
-                println!("ARL saved and verified.");
+                println!("{}", i18n.setup_arl_saved);
                 return Ok(());
             }
             Err(err) => {
-                println!("ARL verification failed: {}", err);
+                println!("{}: {}", i18n.setup_arl_failed, err);
             }
         }
     }
@@ -2327,4 +2245,116 @@ fn save_config(config: &Config) -> AnyResult<()> {
     let data = serde_json::to_string_pretty(config).context("failed to serialize config")?;
     fs::write(&path, data)
         .with_context(|| format!("failed to write config file at {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tokio::sync::mpsc;
+
+    fn render_app(app: &mut App) {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                ui::render(f, app, false);
+            })
+            .unwrap();
+    }
+
+    async fn click(app: &mut App, action: ClickAction, item_row: u16) {
+        render_app(app);
+        let region = app
+            .click_regions
+            .iter()
+            .find(|r| r.action == action)
+            .copied()
+            .expect("click region should exist");
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: region.rect.x + 1,
+            row: region.rect.y + 1 + item_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse_event(mouse, app, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mouse_click_selects_and_opens_playlist() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), tx);
+        app.playlists
+            .push(("1".to_string(), "Alpha".to_string()));
+        app.playlists
+            .push(("2".to_string(), "Beta".to_string()));
+
+        click(&mut app, ClickAction::PlaylistList, 1).await;
+
+        assert_eq!(app.playlist_state.selected(), Some(1));
+        assert_eq!(app.active_panel, ActivePanel::Main);
+    }
+
+    #[tokio::test]
+    async fn mouse_click_on_progress_bar_seeks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), tx);
+        app.now_playing = Some(NowPlaying {
+            id: "t1".to_string(),
+            title: "Starboy".to_string(),
+            artist: "The Weeknd".to_string(),
+            quality: AudioQuality::Kbps320,
+            current_ms: 0,
+            total_ms: 200_000,
+            album_art_url: None,
+        });
+
+        render_app(&mut app);
+        let region = app
+            .click_regions
+            .iter()
+            .find(|r| r.action == ClickAction::SeekBar)
+            .copied()
+            .unwrap();
+        // Click ~3/4 of the way along the bar.
+        let col = region.rect.x + region.rect.width * 3 / 4;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row: region.rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse_event(mouse, &mut app, None).await.unwrap();
+
+        assert!(
+            app.status_message.starts_with("Seek:")
+                || app.status_message.starts_with("Rechercher:"),
+            "expected seek status, got {}",
+            app.status_message
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_click_on_volume_line_focuses_volume() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), tx);
+        render_app(&mut app);
+
+        let region = app
+            .click_regions
+            .iter()
+            .find(|r| r.action == ClickAction::VolumeLine)
+            .copied()
+            .unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: region.rect.x + 1,
+            row: region.rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse_event(mouse, &mut app, None).await.unwrap();
+
+        assert_eq!(app.active_panel, ActivePanel::PlayerInfo);
+    }
 }
